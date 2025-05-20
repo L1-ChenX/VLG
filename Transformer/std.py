@@ -310,16 +310,14 @@ def train_seq2seq(net, data_iter, lr, num_epochs, tgt_vocab, device):
     optimizer = torch.optim.Adam(net.parameters(), lr=lr)
     loss = d2l.MaskedSoftmaxCELoss()
     net.train()
-    animator = d2l.Animator(xlabel='epoch', ylabel='loss',
-                            xlim=[10, num_epochs])
+    animator = d2l.Animator(xlabel='epoch', ylabel='loss', xlim=[10, num_epochs])
     for epoch in range(num_epochs):
         timer = d2l.Timer()
         metric = d2l.Accumulator(2)  # 训练损失总和，词元数量
         for batch in data_iter:
             optimizer.zero_grad()
             X, X_valid_len, Y, Y_valid_len = [x.to(device) for x in batch]
-            bos = torch.tensor([tgt_vocab['<bos>']] * Y.shape[0],
-                               device=device).reshape(-1, 1)
+            bos = torch.tensor([tgt_vocab['<bos>']] * Y.shape[0], device=device).reshape(-1, 1)
             dec_input = torch.cat([bos, Y[:, :-1]], 1)  # 强制教学
             Y_hat = net(X, dec_input, X_valid_len)
             l = loss(Y_hat, Y, Y_valid_len)

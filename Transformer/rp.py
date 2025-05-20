@@ -4,6 +4,8 @@ import torch
 from d2l import torch as d2l
 from torch import nn
 
+from Transformer.std import train_seq2seq
+
 
 class PositionWiseFFN(nn.Module):
     def __init__(self, ffn_num_input, ffn_num_hiddens, ffn_num_output):
@@ -35,16 +37,16 @@ def masked_softmax(X, valid_lens):
         X[~mask] = value
         return X
 
-    # 输入X的形状:(batch_size, num_queries, num_keys)
     if valid_lens is None:
         return nn.functional.softmax(X, dim=-1)
     else:
+        # X.shape:(batch_size, no. of queries, no. of key-value pairs)
         shape = X.shape
         if valid_lens.dim() == 1:
             valid_lens = torch.repeat_interleave(valid_lens, shape[1])
         else:
             valid_lens = valid_lens.reshape(-1)
-        X = _sequence_mask(X.reshape(-1, shape[-1]), valid_lens, value=-1e6)
+        X = _sequence_mask(X.reshape(-1, shape[-1]), valid_lens, 1e-6)
         return nn.functional.softmax(X.reshape(shape), dim=-1)
 
 
@@ -56,23 +58,23 @@ class DotProductAttention(nn.Module):
 
     def forward(self, queries, keys, values, valid_lens=None):
         d = queries.shape[-1]
-        scores = torch.bmm(queries, keys.transpos(1, 2)) / math.sqrt(d)
+        scores = torch.bmm(queries, keys.transpose(1, 2)) / math.sqrt(d)
         self.attention_weights = masked_softmax(scores, valid_lens)
         return torch.bmm(self.dropout(self.attention_weights), values)
 
 
-def transpose_qkv(self, X):
+def transpose_qkv(X, num_heads):
     # 输入X的形状:(batch_size，查询或者“键－值”对的个数，num_hiddens)
     # 最终输出的形状:(batch_size*num_heads,查询或者“键－值”对的个数，num_hiddens/num_heads)
-    X = X.reshape(X.shape[0], X.shape[1], self.num_heads, -1)
+    X = X.reshape(X.shape[0], X.shape[1], num_heads, -1)
     X = X.permute(0, 2, 1, 3)
     return X.reshape(-1, X.shape[2], X.shape[3])
 
 
-def transpose_output(self, X):
+def transpose_output(X, num_heads):
     # 输入X的形状:(batch_size*num_heads,查询或者“键－值”对的个数，num_hiddens/num_heads)
     # 最终输出的形状:(batch_size，查询或者“键－值”对的个数，num_hiddens)
-    X = X.reshape(-1, self.num_heads, X.shape[1], X.shape[2])
+    X = X.reshape(-1, num_heads, X.shape[1], X.shape[2])
     X = X.permute(0, 2, 1, 3)
     return X.reshape(X.shape[0], X.shape[1], -1)
 
@@ -128,12 +130,11 @@ class PositionalEncoding(nn.Module):
         self.PE[:, :, 0::2] = torch.sin(X)
         self.PE[:, :, 1::2] = torch.cos(X)
 
-
-def forward(self, X):
-    # Shape of X: (batch_size, seq_len, d)
-    # Shape of P[:, :seq_len, :]: (1, seq_len, d)
-    X = X + self.PE[:, X.shape[1], :].to(X.device)
-    return self.dropout(X)
+    def forward(self, X):
+        # Shape of X: (batch_size, seq_len, d)
+        # Shape of P[:, :seq_len, :]: (1, seq_len, d)
+        X = X + self.PE[:, X.shape[1], :].to(X.device)
+        return self.dropout(X)
 
 
 class TransformerEncoder(nn.Module):
@@ -175,7 +176,6 @@ class DecoderBlock(nn.Module):
 
     def forward(self, X, state):
         # shape of X: (batch_size, num_steps, d)
-
         enc_output, enc_valid_lens = state[0], state[1]
         if state[2][self.i] is None:
             key_values = X
@@ -185,8 +185,7 @@ class DecoderBlock(nn.Module):
 
         if self.training:
             batch_size, num_steps, _ = X.shape
-            dec_valid_lens = torch.arange(
-                1, num_steps + 1, device=X.device).repeat(batch_size, 1)
+            dec_valid_lens = torch.arange(1, num_steps + 1, device=X.device).repeat(batch_size, 1)
         else:
             dec_valid_lens = None
 
@@ -203,6 +202,7 @@ class TransformerDecoder(nn.Module):
                  num_heads, num_layers, dropout):
         super().__init__()
         self.num_hiddens = num_hiddens
+        self.num_layers = num_layers
         self.embedding = nn.Embedding(vocab_size, num_hiddens)
         self.pos_embedding = PositionalEncoding(num_hiddens, dropout)
         self.blks = nn.Sequential()
@@ -213,6 +213,9 @@ class TransformerDecoder(nn.Module):
                                               num_heads, dropout, i))
         self.dense = nn.Linear(num_hiddens, vocab_size)
 
+    def init_state(self, enc_outputs, enc_valid_lens):
+        return [enc_outputs, enc_valid_lens, [None] * self.num_layers]
+
     def forward(self, X, state):
         X = self.pos_embedding(self.embedding(X) * math.sqrt(self.num_hiddens))
         for i, blk in enumerate(self.blks):
@@ -221,8 +224,29 @@ class TransformerDecoder(nn.Module):
 
 
 if __name__ == '__main__':
+    # train
     num_hiddens, num_layers, dropout, batch_size, num_steps = 32, 2, 0.1, 64, 10
-lr, num_epochs, device = 0.005, 200, d2l.try_gpu()
-ffn_num_input, ffn_num_hiddens, num_heads = 32, 64, 4
-key_size, query_size, value_size = 32, 32, 32
-norm_shape = [32]
+    lr, num_epochs, device = 0.005, 200, d2l.try_gpu()
+    ffn_num_input, ffn_num_hiddens, num_heads = 32, 64, 4
+    key_size, query_size, value_size = 32, 32, 32
+    norm_shape = [32]
+
+    train_iter, src_vocab, tgt_vocab = d2l.load_data_nmt(batch_size, num_steps)
+
+    encoder = TransformerEncoder(
+        len(src_vocab), key_size, query_size, value_size, num_hiddens,
+        norm_shape, ffn_num_input, ffn_num_hiddens, num_heads,
+        num_layers, dropout)
+    decoder = TransformerDecoder(
+        len(tgt_vocab), key_size, query_size, value_size, num_hiddens,
+        norm_shape, ffn_num_input, ffn_num_hiddens, num_heads,
+        num_layers, dropout)
+
+    net = d2l.EncoderDecoder(encoder, decoder)
+
+    batch = next(iter(train_iter))
+    print(len(batch))  # 应该是 4
+    for t in batch:
+        print(t.shape)
+
+    train_seq2seq(net, train_iter, lr, num_epochs, tgt_vocab, device)
