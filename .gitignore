@@ -175,3 +175,5 @@ cython_debug/
 .xml!/data/
 /data/
 
+/ViT/test.jpg
+/CLIP/Prompt_Engineering_for_ImageNet.ipynb
